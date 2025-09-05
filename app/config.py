@@ -24,6 +24,18 @@ class Settings:
     # --- Ödeme Ayarları ---
     PAYMENT_TRC20_ADDRESS: str = os.getenv("PAYMENT_TRC20_ADDRESS")
 
+    # --- Redis Ayarları ---
+    REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
+    REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
+    REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
+    
+    # --- Rate Limiting Ayarları ---
+    RATE_LIMIT_ENABLED: bool = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+    
+    # --- Monitoring Ayarları ---
+    METRICS_ENABLED: bool = os.getenv("METRICS_ENABLED", "true").lower() == "true"
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+    
     # --- Bot için Varsayılan Ayarlar ---
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "LIVE") # Varsayılan olarak LIVE
     BASE_URL: str = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com")

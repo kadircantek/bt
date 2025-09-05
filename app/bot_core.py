@@ -6,6 +6,10 @@ from datetime import datetime, timezone
 from app.binance_client import BinanceClient
 from app.trading_strategy import trading_strategy
 from app.firebase_manager import firebase_manager
+from app.utils.logger import get_logger
+from app.utils.metrics import metrics
+
+logger = get_logger("bot_core")
 
 class BotCore:
     def __init__(self, user_id: str, binance_client: BinanceClient, settings: dict):
@@ -25,6 +29,10 @@ class BotCore:
         self.price_precision = 0
         self.websocket_task = None
         self.subscription_check_interval = 60
+
+        # Metrics tracking
+        self.start_time = None
+        self.websocket_reconnect_count = 0
 
     def _get_precision_from_filter(self, symbol_info, filter_type, key):
         for f in symbol_info['filters']:
@@ -54,11 +62,14 @@ class BotCore:
         if self.status["is_running"]: return
 
         self._stop_requested = False
+        self.start_time = datetime.now(timezone.utc)
         self.status.update({"is_running": True, "status_message": f"{self.settings['symbol']} için başlatılıyor..."})
+
+        logger.info("Bot starting", user_id=self.user_id, symbol=self.settings['symbol'])
 
         if not firebase_manager.is_subscription_active(self.user_id):
             self.status["status_message"] = "Bot başlatılamadı: Aboneliğiniz aktif değil veya süresi dolmuş."
-            print(f"{self.user_id}: Abonelik aktif olmadığı için bot başlatılamadı.")
+            logger.warning("Bot start failed - inactive subscription", user_id=self.user_id)
             await self.stop(); return
 
         if not await self.binance_client.initialize():
@@ -91,16 +102,20 @@ class BotCore:
         self.status["status_message"] = f"{self.settings['symbol']} ({self.settings['timeframe']}) için sinyal bekleniyor..."
         ws_url = f"wss://fstream.binance.com/ws/{self.settings['symbol'].lower()}@kline_{self.settings['timeframe']}"
         self.websocket_task = asyncio.create_task(self._websocket_listener(ws_url))
-        print(f"{self.user_id}: Bot başarıyla başlatıldı ve WebSocket dinleniyor.")
+        
+        # Update metrics
+        metrics.update_websocket_connections(len(bot_manager.active_bots) if 'bot_manager' in globals() else 1)
+        
+        logger.info("Bot started successfully", user_id=self.user_id, symbol=self.settings['symbol'])
 
     async def _websocket_listener(self, ws_url: str):
-        print(f"{self.user_id} için WebSocket bağlantısı kuruluyor: {ws_url}")
+        logger.info("WebSocket connection starting", user_id=self.user_id, url=ws_url)
         last_subscription_check = datetime.now(timezone.utc)
 
         while not self._stop_requested:
             try:
                 async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
-                    print(f"{self.user_id} için WebSocket bağlantısı başarılı.")
+                    logger.info("WebSocket connected", user_id=self.user_id)
                     while not self._stop_requested:
                         try:
                             message = await asyncio.wait_for(ws.recv(), timeout=60.0)
@@ -110,7 +125,7 @@ class BotCore:
                             if (current_time - last_subscription_check).total_seconds() >= self.subscription_check_interval:
                                 if not firebase_manager.is_subscription_active(self.user_id):
                                     self.status["status_message"] = "Aboneliğiniz sona erdi, bot durduruluyor."
-                                    print(f"{self.user_id}: Aboneliği sona erdiği için bot durdurma isteği.")
+                                    logger.warning("Subscription expired, stopping bot", user_id=self.user_id)
                                     await self.stop()
                                     return
                                 last_subscription_check = current_time
@@ -119,17 +134,22 @@ class BotCore:
                         except asyncio.TimeoutError:
                             await ws.ping()
                         except websockets.exceptions.ConnectionClosed:
-                            print(f"{self.user_id} için WebSocket bağlantısı kapandı. Yeniden bağlanılacak.")
+                            logger.warning("WebSocket connection closed, reconnecting", user_id=self.user_id)
+                            self.websocket_reconnect_count += 1
+                            metrics.record_websocket_reconnection(self.user_id)
                             await asyncio.sleep(5)
                             break
                         except Exception as e:
-                            print(f"{self.user_id} için WebSocket mesaj işleme hatası: {e}")
+                            logger.error("WebSocket message processing error", user_id=self.user_id, error=str(e))
                             await asyncio.sleep(1)
 
             except Exception as e:
-                print(f"{self.user_id} için WebSocket bağlantı hatası: {e}. 5 saniye sonra tekrar denenecek.")
+                logger.error("WebSocket connection error", user_id=self.user_id, error=str(e))
+                self.websocket_reconnect_count += 1
+                metrics.record_websocket_reconnection(self.user_id)
                 await asyncio.sleep(5)
-        print(f"{self.user_id} için WebSocket dinleyicisi durduruldu.")
+        
+        logger.info("WebSocket listener stopped", user_id=self.user_id)
 
 
     async def stop(self):
@@ -138,10 +158,11 @@ class BotCore:
 
             open_positions = await self.binance_client.get_open_positions(self.settings["symbol"])
             if open_positions:
-                print(f"--> {self.user_id}: Bot durdurulurken açık pozisyonlar kapatılıyor...")
+                logger.info("Closing open positions on bot stop", user_id=self.user_id)
                 await self.binance_client.close_open_position_and_orders(self.settings["symbol"])
                 pnl = await self.binance_client.get_last_trade_pnl(self.settings["symbol"])
                 firebase_manager.log_trade(self.user_id, {"symbol": self.settings["symbol"], "pnl": pnl, "status": "CLOSED_ON_BOT_STOP", "timestamp": datetime.now(timezone.utc)})
+                metrics.record_trade(self.user_id, self.settings["symbol"], "CLOSE", pnl, "bot_stop")
                 await asyncio.sleep(1)
 
             if self.websocket_task and not self.websocket_task.done():
@@ -149,15 +170,21 @@ class BotCore:
                 try:
                     await self.websocket_task
                 except asyncio.CancelledError:
-                    print(f"{self.user_id}: WebSocket görevi iptal edildi.")
+                    logger.info("WebSocket task cancelled", user_id=self.user_id)
                 except Exception as e:
-                    print(f"{self.user_id}: WebSocket görevi iptal edilirken hata: {e}")
+                    logger.error("Error cancelling WebSocket task", user_id=self.user_id, error=str(e))
 
             if self.status["is_running"]:
                 self.status.update({"is_running": False, "status_message": "Bot durduruldu."})
-                print(f"{self.user_id} için bot durduruluyor...")
+                logger.info("Bot stopping", user_id=self.user_id)
                 await self.binance_client.close()
-                print(f"{self.user_id} için bot başarıyla durduruldu.")
+                
+                # Calculate uptime for metrics
+                if self.start_time:
+                    uptime = (datetime.now(timezone.utc) - self.start_time).total_seconds()
+                    logger.info("Bot stopped", user_id=self.user_id, uptime_seconds=uptime, reconnects=self.websocket_reconnect_count)
+                else:
+                    logger.info("Bot stopped", user_id=self.user_id)
 
     async def _handle_websocket_message(self, message: str):
         data = json.loads(message)
@@ -172,14 +199,15 @@ class BotCore:
 
         open_positions = await self.binance_client.get_open_positions(self.settings["symbol"])
         if self.status["position_side"] is not None and not open_positions:
-            print(f"--> {self.user_id}: Pozisyon SL/TP ile veya manuel olarak kapandı.")
+            logger.info("Position closed by SL/TP or manual", user_id=self.user_id)
             pnl = await self.binance_client.get_last_trade_pnl(self.settings["symbol"])
             firebase_manager.log_trade(self.user_id, {"symbol": self.settings["symbol"], "pnl": pnl, "status": "CLOSED_BY_SL_TP_OR_MANUAL", "timestamp": datetime.now(timezone.utc)})
+            metrics.record_trade(self.user_id, self.settings["symbol"], "CLOSE", pnl, "sl_tp_manual")
             self.status["position_side"] = None
 
         signal = trading_strategy.analyze_klines(self.klines)
         if signal != "HOLD":
-            print(f"{self.user_id} - Strateji analizi sonucu: {signal}")
+            logger.info("Strategy signal", user_id=self.user_id, signal=signal)
 
         if signal != "HOLD" and signal != self.status.get("position_side"):
             await self._flip_position(signal)
@@ -189,24 +217,25 @@ class BotCore:
 
         if not firebase_manager.is_subscription_active(self.user_id):
             self.status["status_message"] = "Aboneliğiniz sona erdi, yeni pozisyon açılamıyor."
-            print(f"{self.user_id}: Aboneliği sona erdiği için yeni pozisyon açılamadı.")
+            logger.warning("Cannot open position - subscription expired", user_id=self.user_id)
             await self.stop()
             return
 
         open_positions = await self.binance_client.get_open_positions(symbol)
         if open_positions:
-            print(f"--> {self.user_id}: Ters sinyal geldi. Mevcut {self.status['position_side']} pozisyonu kapatılıyor...")
+            logger.info("Closing existing position for flip", user_id=self.user_id, current_side=self.status['position_side'])
             await self.binance_client.close_open_position_and_orders(symbol)
             pnl = await self.binance_client.get_last_trade_pnl(symbol)
             firebase_manager.log_trade(self.user_id, {"symbol": symbol, "pnl": pnl, "status": "CLOSED_BY_FLIP", "timestamp": datetime.now(timezone.utc)})
+            metrics.record_trade(self.user_id, symbol, "CLOSE", pnl, "flip")
             await asyncio.sleep(1)
 
-        print(f"--> {self.user_id}: Yeni {new_signal} pozisyonu açılıyor...")
+        logger.info("Opening new position", user_id=self.user_id, signal=new_signal)
         side = "BUY" if new_signal == "LONG" else "SELL"
         price = await self.binance_client.get_market_price(symbol)
         if not price:
             self.status["status_message"] = "Yeni pozisyon için fiyat alınamadı."
-            print(f"{self.user_id}: {self.status['status_message']}")
+            logger.error("Failed to get market price", user_id=self.user_id, symbol=symbol)
             return
 
         # quantity hesaplamasını güncelledik ve step_size parametresini kullandık
@@ -214,7 +243,7 @@ class BotCore:
         
         if quantity <= 0:
             self.status["status_message"] = f"Hesaplanan miktar çok düşük: {quantity}"
-            print(f"{self.user_id}: {self.status['status_message']}")
+            logger.error("Calculated quantity too low", user_id=self.user_id, quantity=quantity)
             return
 
         order = await self.binance_client.create_order_with_tp_sl(
@@ -229,7 +258,9 @@ class BotCore:
         if order:
             self.status["position_side"] = new_signal
             self.status["status_message"] = f"Yeni {new_signal} pozisyonu {price} fiyattan açıldı."
+            metrics.record_trade(self.user_id, symbol, side, 0.0, "opened")
+            logger.info("Position opened successfully", user_id=self.user_id, signal=new_signal, price=price)
         else:
             self.status["position_side"] = None
             self.status["status_message"] = "Yeni pozisyon açılamadı."
-        print(f"{self.user_id}: {self.status['status_message']}")
+            logger.error("Failed to open position", user_id=self.user_id)

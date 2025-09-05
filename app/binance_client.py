@@ -2,6 +2,11 @@ import asyncio
 import math
 from binance import AsyncClient
 from binance.exceptions import BinanceAPIException
+from app.utils.error_handler import robust_binance_call
+from app.utils.metrics import metrics
+from app.utils.logger import get_logger
+
+logger = get_logger("binance_client")
 
 class BinanceClient:
     def __init__(self, api_key: str, api_secret: str):
@@ -11,19 +16,23 @@ class BinanceClient:
         self.api_secret = api_secret
         self.client: AsyncClient | None = None
         self.exchange_info = None
+        self.rate_limit_buffer = 0.1  # 100ms buffer between requests
 
+    @robust_binance_call(max_attempts=3)
     async def initialize(self) -> bool:
         if self.client is None:
             try:
                 self.client = await AsyncClient.create(self.api_key, self.api_secret)
                 self.exchange_info = await self.client.get_exchange_info()
-                print(f"Kullanıcı için Binance AsyncClient başarıyla başlatıldı.")
+                logger.info("Binance AsyncClient successfully initialized")
                 return True
             except BinanceAPIException as e:
-                print(f"Binance istemcisi başlatılamadı. API Anahtarlarını kontrol edin. Hata: {e}")
+                logger.error("Failed to initialize Binance client", error=str(e))
+                metrics.record_binance_error(str(e.code) if hasattr(e, 'code') else 'unknown')
                 return False
         return True
 
+    @robust_binance_call(max_attempts=2)
     # get_symbol_info, get_open_positions, get_last_trade_pnl, close,
     # get_historical_klines, set_leverage, get_market_price metodları aynı kalır...
     async def get_symbol_info(self, symbol: str):
@@ -31,13 +40,22 @@ class BinanceClient:
         for s in self.exchange_info['symbols']:
             if s['symbol'] == symbol: return s
         return None
+    
+    @robust_binance_call(max_attempts=2)
     async def get_open_positions(self, symbol: str):
         try:
+            await asyncio.sleep(self.rate_limit_buffer)  # Rate limit protection
             positions = await self.client.futures_position_information(symbol=symbol)
             return [p for p in positions if float(p['positionAmt']) != 0]
-        except BinanceAPIException as e: print(f"Hata: Pozisyon bilgileri alınamadı: {e}"); return []
+        except BinanceAPIException as e: 
+            logger.error("Failed to get positions", symbol=symbol, error=str(e))
+            metrics.record_binance_error(str(e.code) if hasattr(e, 'code') else 'unknown')
+            return []
+    
+    @robust_binance_call(max_attempts=2)
     async def get_last_trade_pnl(self, symbol: str):
         try:
+            await asyncio.sleep(self.rate_limit_buffer)
             trades = await self.client.futures_account_trades(symbol=symbol, limit=10)
             if not trades: return 0.0
             last_order_id = trades[-1]['orderId']
@@ -47,33 +65,61 @@ class BinanceClient:
                     pnl += float(trade['realizedPnl'])
                 else: break
             return pnl
-        except BinanceAPIException as e: print(f"Hata: Son işlem PNL'i alınamadı: {e}"); return 0.0
+        except BinanceAPIException as e: 
+            logger.error("Failed to get last trade PNL", symbol=symbol, error=str(e))
+            metrics.record_binance_error(str(e.code) if hasattr(e, 'code') else 'unknown')
+            return 0.0
+    
     async def close(self):
-        if self.client: await self.client.close_connection(); self.client = None
+        if self.client: 
+            await self.client.close_connection()
+            self.client = None
+            logger.info("Binance client connection closed")
+    
+    @robust_binance_call(max_attempts=2)
     async def get_historical_klines(self, symbol: str, interval: str, limit: int = 100):
         try:
+            await asyncio.sleep(self.rate_limit_buffer)
             return await self.client.get_historical_klines(symbol, interval, limit=limit)
-        except BinanceAPIException as e: print(f"Hata: Geçmiş mum verileri çekilemedi: {e}"); return []
+        except BinanceAPIException as e: 
+            logger.error("Failed to get historical klines", symbol=symbol, error=str(e))
+            metrics.record_binance_error(str(e.code) if hasattr(e, 'code') else 'unknown')
+            return []
+    
+    @robust_binance_call(max_attempts=2)
     async def set_leverage(self, symbol: str, leverage: int):
         try:
+            await asyncio.sleep(self.rate_limit_buffer)
             await self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
-            print(f"Başarılı: {symbol} kaldıracı {leverage}x olarak ayarlandı.")
+            logger.info("Leverage set successfully", symbol=symbol, leverage=leverage)
             return True
-        except BinanceAPIException as e: print(f"Hata: Kaldıraç ayarlanamadı: {e}"); return False
+        except BinanceAPIException as e: 
+            logger.error("Failed to set leverage", symbol=symbol, leverage=leverage, error=str(e))
+            metrics.record_binance_error(str(e.code) if hasattr(e, 'code') else 'unknown')
+            return False
+    
+    @robust_binance_call(max_attempts=2)
     async def get_market_price(self, symbol: str):
         try:
-            ticker = await self.client.futures_symbol_ticker(symbol=symbol); return float(ticker['price'])
-        except BinanceAPIException as e: print(f"Hata: {symbol} fiyatı alınamadı: {e}"); return None
+            await asyncio.sleep(self.rate_limit_buffer)
+            ticker = await self.client.futures_symbol_ticker(symbol=symbol)
+            return float(ticker['price'])
+        except BinanceAPIException as e: 
+            logger.error("Failed to get market price", symbol=symbol, error=str(e))
+            metrics.record_binance_error(str(e.code) if hasattr(e, 'code') else 'unknown')
+            return None
 
     # (GÜNCELLENDİ) TP ve SL ile birlikte emir oluşturma
+    @robust_binance_call(max_attempts=2)
     async def create_order_with_tp_sl(self, symbol: str, side: str, quantity: float, entry_price: float, price_precision: int, stop_loss_percent: float, take_profit_percent: float):
         def format_price(price):
             return f"{price:.{price_precision}f}"
         
         try:
             # 1. Ana piyasa emrini oluştur
+            await asyncio.sleep(self.rate_limit_buffer)
             main_order = await self.client.futures_create_order(symbol=symbol, side=side, type='MARKET', quantity=quantity)
-            print(f"Başarılı: {symbol} {side} {quantity} PİYASA EMRİ oluşturuldu.")
+            logger.info("Market order created", symbol=symbol, side=side, quantity=quantity)
             await asyncio.sleep(0.5)
 
             # 2. TP ve SL fiyatlarını hesapla
@@ -85,27 +131,32 @@ class BinanceClient:
 
             # 3. TP ve SL emirlerini oluştur
             opposite_side = 'SELL' if side == 'BUY' else 'BUY'
+            await asyncio.sleep(self.rate_limit_buffer)
             await self.client.futures_create_order(
                 symbol=symbol, side=opposite_side, type='STOP_MARKET', 
                 stopPrice=formatted_sl_price, closePosition=True
             )
+            await asyncio.sleep(self.rate_limit_buffer)
             await self.client.futures_create_order(
                 symbol=symbol, side=opposite_side, type='TAKE_PROFIT_MARKET', 
                 stopPrice=formatted_tp_price, closePosition=True
             )
-            print(f"Başarılı: {symbol} için SL({formatted_sl_price}) ve TP({formatted_tp_price}) emirleri kuruldu.")
+            logger.info("TP/SL orders created", symbol=symbol, sl_price=formatted_sl_price, tp_price=formatted_tp_price)
             return main_order
         except BinanceAPIException as e:
-            print(f"Hata: TP/SL ile emir oluşturulurken sorun oluştu: {e}")
+            logger.error("Failed to create order with TP/SL", symbol=symbol, error=str(e))
+            metrics.record_binance_error(str(e.code) if hasattr(e, 'code') else 'unknown')
             await self.close_open_position_and_orders(symbol)
             return None
 
     # (YENİ) Açık pozisyonu ve ilişkili emirleri kapatan yardımcı fonksiyon
+    @robust_binance_call(max_attempts=2)
     async def close_open_position_and_orders(self, symbol: str):
         try:
             # Önce açıkta kalan SL/TP gibi emirleri iptal et
+            await asyncio.sleep(self.rate_limit_buffer)
             await self.client.futures_cancel_all_open_orders(symbol=symbol)
-            print(f"{symbol} için açık emirler iptal edildi.")
+            logger.info("Open orders cancelled", symbol=symbol)
             await asyncio.sleep(0.1)
             
             # Sonra pozisyonu kapat
@@ -114,12 +165,14 @@ class BinanceClient:
                 position = positions[0]
                 position_amt = float(position['positionAmt'])
                 side_to_close = 'SELL' if position_amt > 0 else 'BUY'
+                await asyncio.sleep(self.rate_limit_buffer)
                 await self.client.futures_create_order(
                     symbol=symbol, side=side_to_close, type='MARKET', 
                     quantity=abs(position_amt), reduceOnly=True
                 )
-                print(f"--> POZİSYON KAPATILDI: {symbol}")
+                logger.info("Position closed", symbol=symbol, quantity=abs(position_amt))
             return True
         except BinanceAPIException as e:
-            print(f"Hata: Pozisyon ve emirler kapatılırken sorun oluştu: {e}")
+            logger.error("Failed to close position and orders", symbol=symbol, error=str(e))
+            metrics.record_binance_error(str(e.code) if hasattr(e, 'code') else 'unknown')
             return False

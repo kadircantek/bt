@@ -1,8 +1,10 @@
 import asyncio
+import time
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta, timezone
 from functools import wraps 
@@ -11,12 +13,70 @@ from typing import Optional, Dict, Any
 from app.bot_manager import bot_manager, StartRequest
 from app.config import settings
 from app.firebase_manager import firebase_manager, db
+from app.utils.logger import setup_logging, get_logger
+from app.utils.rate_limiter import limiter, rate_limit_exceeded_handler
+from app.utils.metrics import metrics, get_metrics_data, get_metrics_content_type
+from app.utils.validation import EnhancedStartRequest, EnhancedApiKeysRequest, validate_user_input
+from slowapi.errors import RateLimitExceeded
 
+# Setup logging
+setup_logging()
+logger = get_logger("main")
 app = FastAPI(
     title="EzyagoTrading - Futures Bot SaaS", 
-    version="4.0.0",
+    version="4.1.0",
     description="Gelişmiş çok kullanıcılı futures trading bot sistemi"
 )
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Production'da specific origins kullanın
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Add rate limiting
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+
+# Middleware for request logging and metrics
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    
+    # Log request
+    logger.info(
+        "Request started",
+        method=request.method,
+        path=request.url.path,
+        client_ip=request.client.host if request.client else "unknown"
+    )
+    
+    response = await call_next(request)
+    
+    # Calculate duration
+    duration = time.time() - start_time
+    
+    # Record metrics
+    metrics.record_api_request(
+        endpoint=request.url.path,
+        method=request.method,
+        status_code=response.status_code,
+        duration=duration
+    )
+    
+    # Log response
+    logger.info(
+        "Request completed",
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        duration=f"{duration:.3f}s"
+    )
+    
+    return response
 
 # YENİ: Kullanıcı ayarları modeli
 class UserSettingsRequest(BaseModel):
@@ -48,6 +108,7 @@ bearer_scheme = HTTPBearer()
 
 async def get_current_user(token: str = Depends(bearer_scheme)):
     """Firebase token'ı doğrular ve kullanıcı verilerini döndürür"""
+    try:
     user_payload = firebase_manager.verify_token(token.credentials)
     if not user_payload:
         raise HTTPException(status_code=401, detail="Geçersiz kimlik bilgisi.")
@@ -63,6 +124,9 @@ async def get_current_user(token: str = Depends(bearer_scheme)):
     user_data['role'] = 'admin' if user_payload.get('admin', False) else 'user'
     
     return user_data
+    except Exception as e:
+        logger.error("Authentication failed", error=str(e))
+        raise HTTPException(status_code=401, detail="Authentication failed")
 
 async def get_active_subscriber(user: dict = Depends(get_current_user)):
     """Aktif aboneliği olan kullanıcıları kontrol eder"""
@@ -78,47 +142,86 @@ async def get_admin_user(user: dict = Depends(get_current_user)):
 
 # --- Bot Endpoint'leri ---
 @app.post("/api/start", summary="Botu başlatır")
-async def start_bot_endpoint(bot_settings: StartRequest, user: dict = Depends(get_active_subscriber)):
+@limiter.limit("3/minute")  # Dakikada 3 bot başlatma
+async def start_bot_endpoint(request: Request, bot_settings: EnhancedStartRequest, user: dict = Depends(get_active_subscriber)):
     """Kullanıcı için trading botunu başlatır"""
-    # Validasyon
-    if bot_settings.leverage < 1 or bot_settings.leverage > 125:
-        raise HTTPException(status_code=400, detail="Kaldıraç 1-125 arasında olmalı")
+    try:
+        logger.info("Bot start requested", user_id=user['uid'], symbol=bot_settings.symbol)
     
-    if bot_settings.order_size < 10:
-        raise HTTPException(status_code=400, detail="Minimum işlem büyüklüğü 10 USDT")
+        # Kullanıcı ayarlarını kaydet
+        await save_user_settings_internal(user['uid'], {
+            'symbol': bot_settings.symbol,
+            'leverage': bot_settings.leverage,
+            'orderSize': bot_settings.order_size,
+            'tp': bot_settings.take_profit,
+            'sl': bot_settings.stop_loss,
+            'timeframe': bot_settings.timeframe
+        })
     
-    if bot_settings.take_profit <= bot_settings.stop_loss:
-        raise HTTPException(status_code=400, detail="Take Profit, Stop Loss'tan büyük olmalı")
+        # Convert to original StartRequest for compatibility
+        start_request = StartRequest(
+            symbol=bot_settings.symbol,
+            timeframe=bot_settings.timeframe,
+            leverage=bot_settings.leverage,
+            order_size=bot_settings.order_size,
+            stop_loss=bot_settings.stop_loss,
+            take_profit=bot_settings.take_profit
+        )
+        
+        result = await bot_manager.start_bot_for_user(user['uid'], start_request)
     
-    # Kullanıcı ayarlarını kaydet
-    await save_user_settings_internal(user['uid'], {
-        'symbol': bot_settings.symbol,
-        'leverage': bot_settings.leverage,
-        'orderSize': bot_settings.order_size,
-        'tp': bot_settings.take_profit,
-        'sl': bot_settings.stop_loss,
-        'timeframe': bot_settings.timeframe
-    })
+        if "error" in result:
+            logger.error("Bot start failed", user_id=user['uid'], error=result["error"])
+            raise HTTPException(status_code=400, detail=result["error"])
+        
+        # Record metrics
+        metrics.record_bot_start(user['uid'], bot_settings.symbol)
+        
+        logger.info("Bot started successfully", user_id=user['uid'], symbol=bot_settings.symbol)
+        return {"success": True, **result}
     
-    result = await bot_manager.start_bot_for_user(user['uid'], bot_settings)
-    
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
-    
-    return {"success": True, **result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Unexpected error in bot start", user_id=user['uid'], error=str(e))
+        metrics.record_error("bot_start_error", "main")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/api/stop", summary="Botu durdurur")
-async def stop_bot_endpoint(user: dict = Depends(get_current_user)):
+@limiter.limit("10/minute")
+async def stop_bot_endpoint(request: Request, user: dict = Depends(get_current_user)):
     """Kullanıcının botunu durdurur"""
-    result = await bot_manager.stop_bot_for_user(user['uid'])
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
-    return {"success": True, **result}
+    try:
+        logger.info("Bot stop requested", user_id=user['uid'])
+        
+        result = await bot_manager.stop_bot_for_user(user['uid'])
+        if "error" in result:
+            logger.error("Bot stop failed", user_id=user['uid'], error=result["error"])
+            raise HTTPException(status_code=400, detail=result["error"])
+        
+        # Record metrics
+        metrics.record_bot_stop(user['uid'], "unknown", "manual")
+        
+        logger.info("Bot stopped successfully", user_id=user['uid'])
+        return {"success": True, **result}
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Unexpected error in bot stop", user_id=user['uid'], error=str(e))
+        metrics.record_error("bot_stop_error", "main")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/status", summary="Bot durumunu alır")
-async def get_status_endpoint(user: dict = Depends(get_current_user)):
+@limiter.limit("30/minute")
+async def get_status_endpoint(request: Request, user: dict = Depends(get_current_user)):
     """Kullanıcının bot durumunu döndürür"""
     status = bot_manager.get_bot_status(user['uid'])
+    
+    # Update active bots metric
+    active_bot_count = len([bot for bot in bot_manager.active_bots.values() if bot.status.get("is_running", False)])
+    metrics.update_active_bots(active_bot_count)
+    
     return {
         "is_running": status.get("is_running", False),
         "status_message": status.get("status_message", "Bot durumu bilinmiyor"),
@@ -236,22 +339,84 @@ async def get_user_profile(user: dict = Depends(get_current_user)):
     }
 
 # --- API Anahtarları ---
-class ApiKeysRequest(BaseModel):
-    api_key: str
-    api_secret: str
 
 @app.post("/api/save-keys", summary="API anahtarlarını kaydeder")
-async def save_api_keys(request: ApiKeysRequest, user: dict = Depends(get_current_user)):
+@limiter.limit("5/minute")
+async def save_api_keys(request: Request, api_keys: EnhancedApiKeysRequest, user: dict = Depends(get_current_user)):
     """Kullanıcının Binance API anahtarlarını şifreli olarak kaydeder"""
-    if not request.api_key.strip() or not request.api_secret.strip():
-        raise HTTPException(status_code=400, detail="API Key ve Secret boş olamaz")
-    
     try:
-        firebase_manager.update_user_api_keys(user['uid'], request.api_key.strip(), request.api_secret.strip())
+        logger.info("API keys save requested", user_id=user['uid'])
+        
+        firebase_manager.update_user_api_keys(user['uid'], api_keys.api_key, api_keys.api_secret)
+        
+        logger.info("API keys saved successfully", user_id=user['uid'])
         return {"success": True, "message": "API anahtarları güvenli şekilde kaydedildi"}
     except Exception as e:
-        print(f"API keys kaydetme hatası: {e}")
+        logger.error("Failed to save API keys", user_id=user['uid'], error=str(e))
+        metrics.record_error("api_keys_save_error", "main")
         raise HTTPException(status_code=500, detail="API anahtarları kaydedilemedi")
+
+# --- Metrics Endpoint ---
+@app.get("/metrics", summary="Prometheus metrics")
+async def get_metrics():
+    """Prometheus formatında metrics döndürür"""
+    return Response(
+        content=get_metrics_data(),
+        media_type=get_metrics_content_type()
+    )
+
+# --- Health Check (Enhanced) ---
+@app.get("/health", summary="Sistem sağlık kontrolü")
+async def health_check():
+    """Gelişmiş sistem durumu kontrolü"""
+    try:
+        health_status = {
+            "status": "healthy",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "version": "4.1.0",
+            "components": {}
+        }
+        
+        # Firebase health check
+        try:
+            db.reference('health').set({
+                'last_check': datetime.now(timezone.utc).isoformat(),
+                'status': 'healthy'
+            })
+            health_status["components"]["firebase"] = "healthy"
+        except Exception as e:
+            health_status["components"]["firebase"] = f"unhealthy: {str(e)}"
+            health_status["status"] = "degraded"
+        
+        # Bot manager health check
+        try:
+            active_bots = len(bot_manager.active_bots)
+            health_status["components"]["bot_manager"] = "healthy"
+            health_status["active_bots"] = active_bots
+            metrics.update_active_bots(active_bots)
+        except Exception as e:
+            health_status["components"]["bot_manager"] = f"unhealthy: {str(e)}"
+            health_status["status"] = "degraded"
+        
+        # Overall status
+        if health_status["status"] == "degraded":
+            return JSONResponse(
+                status_code=503,
+                content=health_status
+            )
+        
+        return health_status
+        
+    except Exception as e:
+        logger.error("Health check failed", error=str(e))
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "error": str(e)
+            }
+        )
 
 # --- Admin Endpoint'leri ---
 @app.get("/api/admin/users", summary="Tüm kullanıcıları listeler (Admin)")
@@ -413,45 +578,28 @@ async def read_admin_page(admin: dict = Depends(get_admin_user)):
 @app.on_event("startup")
 async def startup_event():
     """Uygulama başlatıldığında çalışır"""
-    print("🚀 EzyagoTrading Backend başlatıldı")
-    print(f"Environment: {settings.ENVIRONMENT}")
-    print(f"Firebase Database: {settings.FIREBASE_DATABASE_URL}")
+    logger.info("🚀 EzyagoTrading Backend started", 
+                environment=settings.ENVIRONMENT,
+                firebase_db=settings.FIREBASE_DATABASE_URL)
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Uygulama kapatıldığında tüm botları güvenli şekilde durdurur"""
-    print("📴 Sistem kapatılıyor, tüm botlar durduruluyor...")
+    logger.info("📴 System shutting down, stopping all bots...")
     await bot_manager.shutdown_all_bots()
-    print("✅ Tüm botlar güvenli şekilde durduruldu")
-
-# --- Health Check ---
-@app.get("/health", summary="Sistem sağlık kontrolü")
-async def health_check():
-    """Sistem durumunu kontrol eder"""
-    try:
-        # Firebase bağlantısını test et
-        db.reference('health').set({
-            'last_check': datetime.now(timezone.utc).isoformat(),
-            'status': 'healthy'
-        })
-        
-        active_bots = len(bot_manager.active_bots)
-        
-        return {
-            "status": "healthy",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "active_bots": active_bots,
-            "version": "4.0.0"
-        }
-    except Exception as e:
-        print(f"Health check hatası: {e}")
-        raise HTTPException(status_code=503, detail="Sistem sağlıksız")
+    logger.info("✅ All bots stopped safely")
 
 # --- Error Handlers ---
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     """HTTP hatalarını yakalar ve loglar"""
-    print(f"HTTP Hata {exc.status_code}: {exc.detail} - Path: {request.url.path}")
+    logger.error("HTTP Exception", 
+                status_code=exc.status_code, 
+                detail=exc.detail, 
+                path=request.url.path)
+    
+    metrics.record_error(f"http_{exc.status_code}", "main")
+    
     return {
         "error": True,
         "status_code": exc.status_code,
@@ -462,7 +610,9 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 @app.exception_handler(500)
 async def internal_server_error_handler(request: Request, exc):
     """500 hatalarını yakalar"""
-    print(f"İç sunucu hatası: {exc} - Path: {request.url.path}")
+    logger.error("Internal Server Error", error=str(exc), path=request.url.path)
+    metrics.record_error("internal_server_error", "main")
+    
     return {
         "error": True,
         "status_code": 500,
