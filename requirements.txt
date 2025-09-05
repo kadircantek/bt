@@ -7,4 +7,9 @@ websockets
 pandas
 firebase-admin
 cryptography
+slowapi
+tenacity
+structlog
+prometheus-client
+redis
 # pydantic          # <-- İsteğe bağlı, genellikle FastAPI ile gelir
