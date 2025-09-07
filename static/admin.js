@@ -486,6 +486,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 console.error('Could not copy text: ', err);
                 fallbackCopy(text);
             });
+            await loadPaymentNotifications();
+            
+            // Refresh notifications every 30 seconds
+            setInterval(loadPaymentNotifications, 30000);
         } else {
             fallbackCopy(text);
         }
