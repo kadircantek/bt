@@ -11,8 +11,8 @@ firebase-admin==6.2.0
 # Binance API
 python-binance==1.0.19
 
-# Security & Crypto (Python 3.13 compatible)
-cryptography>=42.0.0
+# Security & Crypto - Use older stable version with pre-compiled wheels
+cryptography==3.4.8
 
 # Database & Caching
 redis==5.0.1
